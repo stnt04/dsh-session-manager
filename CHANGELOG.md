@@ -1,3 +1,54 @@
+## v0.3.0 (2026-09-26)
+
+本次为 **DSH 0.1.7-rc.2 兼容性适配**，同时修复了仓库里长期存在的构建与发布问题。
+
+### 兼容性（必须升级 DSH 到 0.1.7-rc.2 才能使用本版本）
+
+- **修复「会话管理」「对话管理」点击无反应**：`@deepseek-ai/dsh-client-ui-primitives` 已移除 `IconTrashOutline16` 等 `<名字>16` 系列导出（命名改为 `<名字>Regular`(1px) / `<名字>Medium`(1.3px)，尺寸由 `size` 属性决定）。渲染删除按钮时 `createElement(undefined)` 触发 React error #130，被 DSH 记为 `slot entry crashed` 后界面保持原样，因此表现为「点击没反应」。已改用 `IconTrashOutlineRegular`（[#23](https://github.com/dream12347/dsh-session-manager/issues/23)）
+- **修复客户端条目无法加载**：`dsh.client.inject` 原先声明了已不存在的 `@deepseek-ai/dsh-client-runtime`。现按「服务/slot 的实际提供方」重写为 7 项，并区分了**客户端插件**与**库**——`dsh-client-ui-slots` / `dsh-client-ui-primitives` 是无 `dsh` 块的库（会被内联），不应出现在 `inject` 中（[#22](https://github.com/dream12347/dsh-session-manager/issues/22)）
+- **修复启动守卫判定 BROKEN 并自动禁用**：移除客户端 bundle 中两段顶层的 DOM IIFE（向 `document.head` 注入导航图标样式 + `MutationObserver(document.body)`）。该逻辑早已在源码中改为正规 slot 实现，但仓库里提交的 `lib/client.js` 自 v0.2.0 起未重建，一直带着这两段旧代码（[#15](https://github.com/dream12347/dsh-session-manager/issues/15)）
+
+### 修复（构建与发布）
+
+- **`devDependencies` 不再指向作者本机**：原为 `link:C:/Users/mengxiang/AppData/...`，在任何其他机器上都无法安装。现改为 DSH 0.1.7-rc.2 的真实版本号，`pnpm install && pnpm build` 可复现
+- **重建 `lib/`**：产物此前与 `src/` 脱节（仍引用旧图标名与旧 DOM hack）。本次一并重建 host 与 client 两半
+- `peerDependencies`：移除已不存在的 `@deepseek-ai/dsh-agent-presets`（改为 `dsh-agent-preset-registry`），删除从未被引用的 `js-yaml`
+
+### 适配（host 半）
+
+- **会话元数据读取**：`sessionPersistence.list()` 现在返回 `SessionPersistenceSnapshot`，元数据位于 `.header` 下（`.id` / `.cwd` / `.version` 不再直接暴露）
+- **`locate()` 已移出 `SessionPersistence` 契约**（现在只暴露 `create`/`open`/`flush`/`stat`/`list`）。它仅作为 JSONL 后端的诊断钩子存在，且接收 `SessionHeader` 而非快照。现以窄化转型 + **特性检测**访问：后端没有该方法时降级为「只归档、不移动文件」并记录警告，而不是让每次删除都返回 500
+- **归档/取消归档改用官方 API** `workspaceRegistry.archiveSession()` / `unarchiveSession()`，并删除对私有 `state` 字段的直接写入（新版的官方实现会在一次 `setState` 中同时更新持久域与缓存，且域结构已新增 `initialized` / `pendingMutation` / `pinnedSessionIds`）
+- **压缩阈值不再读写预设文件**：新版预设是内联的 `@deepseek-ai/dsh-agent-preset` bundle 行，`agentPresets.resolve()` 只返回 `{ id, name?, description?, order?, broken? }`，**没有 `path` / `trust`**。存储域成为唯一真源，GET 响应新增 `source` 字段（`saved` / `default`）以便界面区分「已保存」与「插件默认值」。
+
+### 行为变化（请留意）
+
+- **压缩阈值**：直接写在你自己的预设里的 `thresholdRatio`，在插件里首次保存之前不再被镜像显示（预设文件模型已不存在）。插件保存过的值不受影响，仍然全量生效并跨重启保留
+- **彻底删除（purge）**：新增活会话保护——若该会话仍处于活跃状态，不再无条件删除其原目录。原实现会删掉删除动作之后新写入的日志
+
+### 适配（client 半）
+
+- 类型与 API 迁移：`@deepseek-ai/dsh-client-runtime`（包已删除）中的 `SessionListState` / `SessionSummary` / `ISessions` / `SessionTarget` 改由 `@deepseek-ai/dsh-api-session-controller/client` 提供，`SlotRegistry` 改由 `@deepseek-ai/dsh-client-ui-renderer/client` 提供，`IWorkspaces` / `WorkspaceSnapshot` / `WorkspaceId` 改由 `@deepseek-ai/dsh-api-workspace-controller/client` 提供，`SessionId` 改由 `@deepseek-ai/dsh-api-remotes/client` 提供
+- 已删除的 `ConnectionHandle.api` 门面（`IApiClient`）拆解为官方客户端服务：`sessions`（`ISessions`）/ `workspaces`（`IWorkspaces`）。插件自身的 `/dsh-session-manager/*` 路由位于 `/api` 鉴权栅栏之外，浏览器侧仍用原生 `fetch`，无需改动
+- 会话内导航由 `sessions.open(...)` 改为 `ctx.uiWorkspace.openSession(...)`（`SessionTarget`）
+- **统计改读官方 `sessionStats` 投影**：旧的 `session.history` RPC 已被 `session.page` 取代（需先经 `session.follow` 取 `throughSeq`，属分页式重写），改为直接读已加载的列表快照 `projectionsBySession[id].values.sessionStats`，无 RPC、无加载态
+- **每会话状态改用官方 `useSessionStatus()`**：不再有私有的 `pendingInteraction` / `completed` 字段
+- 抽屉的工作区列表由「5 秒轮询的 RPC 快照」改为官方实时 Controller 快照；轮询仅保留用于刷新回收站
+
+### 行为变化（client 半）
+
+- **统计弹窗字段变化**：现在显示 轮次 / 步骤 / 模型耗时 / 工具耗时 / 首 token 延迟与步数 / 解码耗时与输出 token。**不再显示** 用户消息数、助手消息数、逐工具调用明细与活动时间窗——官方投影不含这些字段（且旧值是「近期一段历史」的折叠，新值是**全日志**口径）
+- **统计不再有加载/错误态**：无 RPC 即无需等待；宿主尚未投影该会话时显示「暂无统计数据」而非报错
+- **「当前选中会话」自动标记已读已移除**：0.1.7-rc.2 不再暴露公开的当前会话标识（选区是工作区服务的私有状态）。手动标记（蓝点）与打开会话时标记读**不受影响**
+- **设置页的「当前会话」标识与保护已移除**：当前会话不再被排除在批量/工作区选择之外，也不再受删除保护；删除现在仅对**运行中**的会话禁用（host 路由仍会以 `session-live` 拒绝活跃会话）
+- **琥珀/绿色官方状态点**：原先靠改写官方 `SessionManager` 私有状态实现"就地已读"，该 API 已不存在；现在点击会**打开该会话**（即官方定义的已读动作，同时关闭面板/抽屉）。蓝点与运行中圆点的行为不变
+- 语言字典：删除 6 个失效键（`statsLoading` / `statsFailed` / `statsUser` / `statsAssistant` / `statsTools` / `statsWindow`），新增 5 个（`statsSteps` / `statsLlmMs` / `statsToolMs` / `statsTtft` / `statsDecode`）
+
+### 说明
+
+- 统计功能现在依赖宿主的 `sessionStats` 投影单元被挂载（该单元随 DSH 发行，见 `@deepseek-ai/dsh-session-stats`）。若当前组合未挂载它，弹窗只会显示「暂无统计数据」，不会报错
+- 仓库自带测试（`vitest`）3/3 通过；`tsc --noEmit` 与声明生成均 0 错误
+
 ## v0.2.2 (2026-08-20)
 
 ### 修复

@@ -3,15 +3,20 @@
  *
  * Registers a dedicated Settings section ("会话管理" / Session Manager) via
  * the official `settings.section` slot. The panel lists every session from
- * the `useSessions` standard feed, marks the current/running ones as
- * protected, groups archived sessions at the bottom, and deletes sessions
- * through the host route (with a confirm step). Each row can also fold a
- * recent-activity stats (via the official `session.history` RPC) and reveal
- * the session's log directory in the system file manager.
+ * the `useSessions` standard feed, marks the running ones as protected, groups archived sessions at the bottom, and deletes sessions
+ * through the host route (with a confirm step). Each row can also fold the
+ * official `sessionStats` projection (whole-log turn/step counts and wall
+ * times) and reveal the session's log directory in the system file manager.
  */
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SessionListState, SessionSummary, SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { ISessions, SessionListState, SessionSummary, SessionTarget } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+import type { IWorkspaces, WorkspaceId, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
+// Type-only: brings the `sessionStats` projection-key declaration into this program.
+import type { SessionStatsProjection } from '@deepseek-ai/dsh-session-stats/client'
+// Type-only: brings the `useSessionStatus` standard prop and SessionStatus into this program.
+import type { SessionStatus, UseSessionStatus } from '@deepseek-ai/dsh-client-ui-session/client'
 // Type-only: brings the `settings.section` SlotMap declaration into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: brings the `sidebar.footer.action` SlotMap declaration into this program.
@@ -22,11 +27,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: merges the 'title' projection key the wire session summaries read.
 import type {} from '@deepseek-ai/dsh-session-title/client'
-// Type-only: brings the connection/remote merges and IApiClient types.
-import type {} from '@deepseek-ai/dsh-api-remotes/client'
-import type { ConnectionHandle, HistoryEntry, SessionId as WireSessionId } from '@deepseek-ai/dsh-api-remotes/client'
-import type { WorkspaceView } from '@deepseek-ai/dsh-api-remotes/client'
-import { Button, IconTrashOutline16, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconTrashOutlineRegular, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import { createElement, Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -43,7 +44,7 @@ import {
 } from '../contract.ts'
 
 export const name = 'dsh-session-manager/client'
-export const inject = ['slots', 'locale', 'connection', 'sessions', 'workspaces']
+export const inject = ['slots', 'locale', 'sessions', 'workspaces', 'uiWorkspace']
 
 /** Locale namespace id registered under ctx.locale. */
 export const NS = 'dsh-session-manager'
@@ -126,14 +127,13 @@ function useUnread(): Set<string> {
  * Clicking an OFFICIAL dot opens the session (the official "read" action:
  * select clears the green reminder); clicking the blue one clears the mark. */
 type RowStatusDot = 'ongoing' | 'blue' | 'amber' | 'green' | null
-function rowStatusDot(
-  session: { running?: boolean; pendingInteraction?: unknown; completed?: boolean },
-  manuallyUnread: boolean,
-): RowStatusDot {
-  if (session.running === true) return 'ongoing'
+/** Official per-session UI status facts, indexed by session id. */
+type SessionStatusLookup = ReadonlyMap<SessionId, SessionStatus>
+function rowStatusDot(status: SessionStatus | undefined, manuallyUnread: boolean): RowStatusDot {
+  if (status?.running === true) return 'ongoing'
   if (manuallyUnread) return 'blue'
-  if (session.pendingInteraction !== undefined) return 'amber'
-  if (session.completed === true) return 'green'
+  if (status?.pendingInteraction !== undefined) return 'amber'
+  if (status?.completionUnread === true) return 'green'
   return null
 }
 /** Render the official StateDot for a status, or the clickable read placeholder. */
@@ -814,13 +814,15 @@ const STYLE = `
 
 interface SessionManagerProps {
   useSessions: SnapshotSelectorHook<SessionListState>
-  useWorkspaces: SnapshotSelectorHook<import('@deepseek-ai/dsh-client-runtime/client').WorkspaceListState>
-  /** Wire client for the official session.history RPC (stats folding). */
-  api: Pick<import('@deepseek-ai/dsh-api-remotes/client').IApiClient, 'sessions'>
-  /** Browser sessions service: open a session and close the settings panel. */
-  sessions: import('@deepseek-ai/dsh-client-runtime/client').ISessions
+  useWorkspaces: SnapshotSelectorHook<WorkspaceSnapshot>
+  /** Official per-session UI status feed (running / pending interaction / unread completion). */
+  useSessionStatus: UseSessionStatus
+  /** Browser sessions service: refresh and fork sessions. */
+  sessions: ISessions
   /** Workspaces service: durable workspace reordering (drag & drop). */
-  workspaceActions: import('@deepseek-ai/dsh-client-runtime/client').IWorkspaces
+  workspaceActions: IWorkspaces
+  /** Workspace navigation: open a session and close the settings panel. */
+  uiWorkspace: { openSession(target: SessionTarget): void }
   /** Close the settings panel (settings.section owner seat). */
   close: () => void
 }
@@ -830,57 +832,63 @@ interface Notice {
   text: string
 }
 
-/** Folded conversation statistics for one session's recent window. */
-interface SessionStats {
-  turns: number
-  userMessages: number
-  assistantMessages: number
-  toolCalls: { name: string; count: number }[]
-  startedAt: number
-  updatedAt: number
+/**
+ * Read the host business code off a session-controller failure. `SessionForkError`
+ * carries the structured `RemoteFailure`; a runtime value import of the error
+ * classes would be bundled into this client half, so the code is read
+ * structurally instead.
+ */
+function remoteErrorCode(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const rpcError = (error as { rpcError?: { code?: unknown } }).rpcError
+    if (rpcError !== undefined && typeof rpcError.code === 'string') return rpcError.code
+    const code = (error as { code?: unknown }).code
+    if (typeof code === 'string') return code
+  }
+  return error instanceof Error ? error.message : ''
+}
+
+/** Format a millisecond figure for the stats dialog. */
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`
+  const minutes = Math.floor(ms / 60000)
+  const seconds = Math.round((ms % 60000) / 1000)
+  return `${minutes}m ${seconds}s`
 }
 
 /**
- * Fold a history window into an stats. The tail page carries at most
- * `maxMessages` messages, so a long session's stats reflects its recent
- * window; `startedAt`/`updatedAt` are the window's own bounds. Events the
- * fold does not recognize are skipped.
+ * Render the official whole-log session statistics (`sessionStats` projection):
+ * turn/step counts plus the summed model, tool, first-token, and decode wall
+ * times. An absent (or still all-zero) value means the host has projected no
+ * activity for this session yet.
  */
-function foldStats(entries: readonly HistoryEntry[]): SessionStats {
-  let turns = 0
-  let userMessages = 0
-  let assistantMessages = 0
-  const toolCounts = new Map<string, number>()
-  let startedAt = Number.POSITIVE_INFINITY
-  let updatedAt = Number.NEGATIVE_INFINITY
-  for (const entry of entries) {
-    const { type, time, data } = entry.event
-    if (time < startedAt) startedAt = time
-    if (time > updatedAt) updatedAt = time
-    if (type === 'turn/start') turns += 1
-    else if (type === 'user/message') userMessages += 1
-    else if (type === 'assistant/message') assistantMessages += 1
-    else if (type === 'tool/call') {
-      toolCounts.set(data.name, (toolCounts.get(data.name) ?? 0) + 1)
-    }
+function renderStatsBody(
+  strings: ReturnType<typeof stringsOf>,
+  data: SessionStatsProjection | undefined,
+): ReactElement {
+  if (data === undefined || (
+    data.turns === 0 && data.steps === 0 && data.llmMs === 0 && data.toolMs === 0
+    && data.ttftMs === 0 && data.ttftSteps === 0 && data.decodeMs === 0 && data.decodeTokens === 0
+  )) {
+    return createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsEmpty)
   }
-  const toolCalls = [...toolCounts.entries()]
-    .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count)
-  return {
-    turns,
-    userMessages,
-    assistantMessages,
-    toolCalls,
-    startedAt: startedAt === Number.POSITIVE_INFINITY ? 0 : startedAt,
-    updatedAt: updatedAt === Number.NEGATIVE_INFINITY ? 0 : updatedAt,
-  }
-}
-
-/** One session's stats state: loading, ready, or failed. */
-interface StatsState {
-  status: 'loading' | 'ready' | 'error'
-  data: SessionStats | null
+  const items: { label: string; value: string }[] = [
+    { label: strings.statsTurns, value: String(data.turns) },
+    { label: strings.statsSteps, value: String(data.steps) },
+    { label: strings.statsLlmMs, value: formatMs(data.llmMs) },
+    { label: strings.statsToolMs, value: formatMs(data.toolMs) },
+    { label: strings.statsTtft, value: `${formatMs(data.ttftMs)} / ${data.ttftSteps}` },
+    { label: strings.statsDecode, value: `${formatMs(data.decodeMs)} / ${data.decodeTokens}` },
+  ]
+  return createElement('div', { className: 'dsh-stats-dialog__body' },
+    createElement('dl', { className: 'dsh-stats-dialog__grid' },
+      ...items.flatMap((item) => [
+        createElement('dt', { className: 'dsh-stats-dialog__label', key: `${item.label}-label` }, item.label),
+        createElement('dd', { className: 'dsh-stats-dialog__value', key: `${item.label}-value` }, item.value),
+      ]),
+    ),
+  )
 }
 
 type AppLocale = 'zh' | 'en'
@@ -963,14 +971,13 @@ function stringsOf() {
         unread: '标记为未读',
         read: '标记为已读',
         stats: '统计',
-        statsLoading: '统计加载中…',
-        statsFailed: '统计加载失败',
-        statsEmpty: '（近期窗口内没有活动）',
+        statsEmpty: '（暂无统计数据）',
         statsTurns: '轮次',
-        statsUser: '用户消息',
-        statsAssistant: '助手消息',
-        statsTools: '工具调用',
-        statsWindow: '活动窗口',
+        statsSteps: '步骤',
+        statsLlmMs: '模型耗时',
+        statsToolMs: '工具耗时',
+        statsTtft: '首字延迟 / 步数',
+        statsDecode: '解码耗时 / 输出 tokens',
         folder: '文件夹',
         folderOpen: '已在文件管理器中打开',
         folderFailed: '打开文件夹失败',
@@ -1055,14 +1062,13 @@ function stringsOf() {
         unread: 'Mark as unread',
         read: 'Mark as read',
         stats: 'Stats',
-        statsLoading: 'Loading stats…',
-        statsFailed: 'Failed to load stats',
-        statsEmpty: '(no activity in the recent window)',
+        statsEmpty: '(no stats recorded yet)',
         statsTurns: 'turns',
-        statsUser: 'user messages',
-        statsAssistant: 'assistant messages',
-        statsTools: 'tool calls',
-        statsWindow: 'activity window',
+        statsSteps: 'steps',
+        statsLlmMs: 'model time',
+        statsToolMs: 'tool time',
+        statsTtft: 'first-token latency / steps',
+        statsDecode: 'decode time / output tokens',
         folder: 'Folder',
         folderOpen: 'Opened in the file manager',
         folderFailed: 'Failed to open folder',
@@ -1097,9 +1103,10 @@ function stringsOf() {
       }
 }
 
-function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceActions, close }: SessionManagerProps): ReactElement {
+function SessionManager({ useSessions, useWorkspaces, useSessionStatus, sessions, workspaceActions, uiWorkspace, close }: SessionManagerProps): ReactElement {
   const list = useSessions((state) => state)
   const workspaces = useWorkspaces((state) => state)
+  const statuses: SessionStatusLookup = useSessionStatus((state) => state)
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => loadRemoved())
   const [archivedOpen, setArchivedOpen] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
@@ -1109,7 +1116,6 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   const [busyId, setBusyId] = useState<string | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [statsId, setStatsId] = useState<string | null>(null)
-  const [stats, setStats] = useState<StatsState | null>(null)
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set())
   const unread = useUnread()
   const [newestFirst, setNewestFirst] = useState(true)
@@ -1197,7 +1203,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         beforeId = slot.slice(7)
       }
       // '__end__' leaves beforeId undefined → appended to the very end.
-      await workspaceActions.insertBefore(dragged as never, beforeId as never)
+      await workspaceActions.insertBefore(dragged as WorkspaceId, beforeId as WorkspaceId | undefined)
     } catch {
       // Best-effort; the next poll re-baselines the list.
     }
@@ -1209,7 +1215,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     const firstId = order.find((id) => id !== '__ungrouped__')
     if (firstId === undefined || firstId === workspaceId) return
     try {
-      await workspaceActions.insertBefore(workspaceId as never, firstId as never)
+      await workspaceActions.insertBefore(workspaceId as WorkspaceId, firstId as WorkspaceId)
     } catch {
       // Best-effort; the next poll re-baselines the list.
     }
@@ -1222,7 +1228,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     const title = input.trim()
     if (title === '' || title === group.title) return
     try {
-      await workspaceActions.rename(group.workspaceId as never, title as never)
+      await workspaceActions.rename(group.workspaceId as WorkspaceId, title)
     } catch {
       // Best-effort; the next poll re-baselines the list.
     }
@@ -1233,7 +1239,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   const deleteWorkspace = useCallback(async (group: { workspaceId: string; title: string }): Promise<void> => {
     if (!window.confirm(strings.workspaceDeleteConfirm.replace('{title}', group.title))) return
     try {
-      await workspaceActions.delete(group.workspaceId as never)
+      await workspaceActions.delete(group.workspaceId as WorkspaceId)
     } catch {
       // Best-effort; the next poll re-baselines the list.
     }
@@ -1244,7 +1250,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     index: number,
   ): ReactElement => {
     const draggable = group.workspaceId !== '__ungrouped__'
-    const workspaceSelectable = group.rows.filter((session) => !session.running && session.id !== list.current)
+    const workspaceSelectable = group.rows.filter((session) => !session.running)
     const workspaceAllSelected = workspaceSelectable.length > 0 && workspaceSelectable.every((session) => selectedIds.has(session.id))
     const workspaceSomeSelected = workspaceSelectable.some((session) => selectedIds.has(session.id))
     return createElement('div', {
@@ -1419,7 +1425,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       // Drop the deleted session from the official client-side summaries so
       // the subagent catalog (indexSubagentDescendants) stops tracking it
       // (the host never emits session-removed for a cold session we moved).
-      void (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+      void sessions.refresh()
     } catch (error) {
       const code = error instanceof Error ? error.message : ''
       const friendly = code === 'session-live' ? strings.liveError : code === 'session-not-found' ? strings.notFoundError : ''
@@ -1442,7 +1448,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   const toggleSelectAll = useCallback((): void => {
     setSelectedIds((previous) => {
       const next = new Set(previous)
-      const selectable = activeRows.filter((session) => !session.running && session.id !== list.current)
+      const selectable = activeRows.filter((session) => !session.running)
       const allSelected = selectable.length > 0 && selectable.every((session) => next.has(session.id))
       for (const session of selectable) {
         if (allSelected) next.delete(session.id)
@@ -1450,12 +1456,12 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       }
       return next
     })
-  }, [activeRows, list.current])
+  }, [activeRows])
 
   const toggleSelectWorkspace = useCallback((group: { workspaceId: string; rows: SessionSummary[] }): void => {
     setSelectedIds((previous) => {
       const next = new Set(previous)
-      const selectable = group.rows.filter((session) => !session.running && session.id !== list.current)
+      const selectable = group.rows.filter((session) => !session.running)
       const allSelected = selectable.length > 0 && selectable.every((session) => next.has(session.id))
       for (const session of selectable) {
         if (allSelected) next.delete(session.id)
@@ -1463,7 +1469,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       }
       return next
     })
-  }, [list.current])
+  }, [])
 
   const handleBatchDelete = useCallback(async (): Promise<void> => {
     const ids = [...selectedIds]
@@ -1502,7 +1508,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       showNotice({ kind: 'error', text: strings.batchFailed.replace('{msg}', result) })
     }
     // Same as single delete: drop deleted sessions from the retained summaries.
-    void (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+    void sessions.refresh()
   }, [selectedIds, strings, list.byId, loadTrash, showNotice, sessions])
 
   const handleRestore = useCallback(async (sessionId: string, title: string): Promise<void> => {
@@ -1520,7 +1526,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       await loadTrash()
       showNotice({ kind: 'ok', text: strings.restored.replace('{title}', title) })
       // Re-pull the list so a restored session re-enters the client mirror.
-      void (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+      void sessions.refresh()
     } catch (error) {
       const code = error instanceof Error ? error.message : ''
       const suffix = code !== '' ? ` (${code})` : ''
@@ -1546,7 +1552,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       await loadTrash()
       showNotice({ kind: 'ok', text: strings.purged.replace('{title}', title) })
       // Same as delete: drop the purged session from the retained summaries.
-      void (sessions as unknown as { refresh?: () => Promise<unknown> }).refresh?.()
+      void sessions.refresh()
     } catch (error) {
       const code = error instanceof Error ? error.message : ''
       const suffix = code !== '' ? ` (${code})` : ''
@@ -1556,30 +1562,14 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     }
   }, [strings, loadTrash, markRemoved, showNotice, sessions])
 
-  // Toggle the stats for one session: fold the recent history window.
-  const handleStats = useCallback(async (sessionId: string): Promise<void> => {
-    if (statsId === sessionId) {
-      setStatsId(null)
-      setStats(null)
-      return
-    }
-    setStatsId(sessionId)
-    setStats({ status: 'loading', data: null })
-    try {
-      const response = await api.sessions.history({ sessionId: sessionId as WireSessionId })
-      if (!response.result.ok) {
-        setStats({ status: 'error', data: null })
-        return
-      }
-      setStats({ status: 'ready', data: foldStats(response.result.value.events) })
-    } catch {
-      setStats({ status: 'error', data: null })
-    }
-  }, [api, statsId])
+  // Toggle the stats for one session: the official `sessionStats` projection
+  // is already in the list snapshot, so this only opens/closes the dialog.
+  const handleStats = useCallback((sessionId: string): void => {
+    setStatsId((previous) => (previous === sessionId ? null : sessionId))
+  }, [])
 
   const closeStats = useCallback((): void => {
     setStatsId(null)
-    setStats(null)
   }, [])
 
   useEffect(() => {
@@ -1591,14 +1581,14 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [closeStats, statsId])
 
-  // Continue a session: mark it read, open it through the browser sessions
-  // service and close the settings panel so the user lands in the
+  // Continue a session: mark it read, open it through the official workspace
+  // navigation and close the settings panel so the user lands in the
   // conversation.
   const handleContinue = useCallback((sessionId: string): void => {
     markRead(sessionId)
-    sessions.open(sessionId as SessionId)
+    uiWorkspace.openSession(sessionId as SessionId)
     close()
-  }, [sessions, close])
+  }, [uiWorkspace, close])
 
   // Fork the session into a new child conversation (official sessions.fork,
   // cut at the last completed turn), then open the child and close the panel.
@@ -1606,20 +1596,18 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
     setBusyId(sessionId)
     setNotice(null)
     try {
-      const response = await api.sessions.fork({ sessionId: sessionId as WireSessionId })
-      if (!response.result.ok) throw new Error(response.result.error?.code ?? 'fork-failed')
-      const childId = response.result.value.sessionId
-      sessions.open(childId as SessionId)
+      const childId = await sessions.fork({ sessionId: sessionId as SessionId })
+      uiWorkspace.openSession(childId)
       close()
     } catch (error) {
-      const code = error instanceof Error ? error.message : ''
+      const code = remoteErrorCode(error)
       const friendly = code === 'fork-unavailable' ? strings.forkUnavailable : ''
       const suffix = friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''
       showNotice({ kind: 'error', text: strings.forkFailed + suffix })
     } finally {
       setBusyId(null)
     }
-  }, [api, sessions, close, strings, showNotice])
+  }, [sessions, uiWorkspace, close, strings, showNotice])
 
   // Pause a running session: cancel its current turn through the host.
   const handlePause = useCallback(async (sessionId: string): Promise<void> => {
@@ -1666,50 +1654,10 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   }, [strings, showNotice])
 
   const renderStatsDialog = (): ReactElement | null => {
-    if (statsId === null || stats === null) return null
+    if (statsId === null) return null
     const sessionTitle = list.byId[statsId as SessionId]?.displayTitle ?? statsId
-    let body: ReactElement
-    if (stats.status === 'loading') {
-      body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsLoading)
-    } else if (stats.status === 'error') {
-      body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsFailed)
-    } else {
-      const data = stats.data
-      if (data === null || (data.turns === 0 && data.userMessages === 0 && data.assistantMessages === 0 && data.toolCalls.length === 0)) {
-        body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsEmpty)
-      } else {
-        const items: { label: string; value: string | ReactElement }[] = [
-          { label: strings.statsTurns, value: String(data.turns) },
-          { label: strings.statsUser, value: String(data.userMessages) },
-          { label: strings.statsAssistant, value: String(data.assistantMessages) },
-        ]
-        if (data.toolCalls.length > 0) {
-          items.push({
-            label: strings.statsTools,
-            value: createElement('div', { className: 'dsh-stats-dialog__tools' },
-              ...data.toolCalls.map((tool) => createElement('span', {
-                className: 'dsh-stats-dialog__tool',
-                key: tool.name,
-              }, `${tool.name} ×${tool.count}`)),
-            ),
-          })
-        }
-        if (data.startedAt > 0 && data.updatedAt > 0) {
-          items.push({
-            label: strings.statsWindow,
-            value: `${strings.deletedAt(data.startedAt)} ~ ${strings.deletedAt(data.updatedAt)}`,
-          })
-        }
-        body = createElement('div', { className: 'dsh-stats-dialog__body' },
-          createElement('dl', { className: 'dsh-stats-dialog__grid' },
-            ...items.flatMap((item) => [
-              createElement('dt', { className: 'dsh-stats-dialog__label', key: `${item.label}-label` }, item.label),
-              createElement('dd', { className: 'dsh-stats-dialog__value', key: `${item.label}-value` }, item.value),
-            ]),
-          ),
-        )
-      }
-    }
+    const stats = list.projectionsBySession[statsId as SessionId]?.values?.['sessionStats']
+    const body: ReactElement = renderStatsBody(strings, stats)
     return createElement('div', {
       'data-dsh-stats-backdrop': '',
       onMouseDown: (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -1742,19 +1690,16 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
   }
 
   const renderRow = (session: SessionSummary, isArchived: boolean): ReactElement => {
-    const isCurrent = !isArchived && session.id === list.current
     const isRunning = session.running
     const busy = busyId === session.id
-    const protectedReason = isCurrent ? strings.current : isRunning ? strings.running : ''
+    const protectedReason = isRunning ? strings.running : ''
     const metaParts = [session.cwd ?? strings.noCwd]
     if (isArchived) metaParts.push(strings.archived)
-    if (protectedReason !== '' && !isCurrent) metaParts.push(protectedReason)
+    if (protectedReason !== '') metaParts.push(protectedReason)
     const statsOpen = statsId === session.id
     return createElement('li', {
       key: session.id,
       className: 'dsh-delete-session__row',
-      'data-current': isCurrent || undefined,
-      'data-current-label': strings.current,
       'data-archived': isArchived || undefined,
       'data-stats-open': statsOpen || undefined,
     },
@@ -1771,31 +1716,16 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         createElement('div', { className: 'dsh-delete-session__row-title', title: session.displayTitle },
           createElement('span', { className: 'dsh-delete-session__row-title-text' }, session.displayTitle),
           (() => {
-            const dotStatus = rowStatusDot(session, unread.has(session.id))
+            const dotStatus = rowStatusDot(statuses.get(session.id), unread.has(session.id))
             return renderStatusDot(
               dotStatus,
               dotStatus !== null ? strings.read : strings.unread,
               () => {
                 if (dotStatus === 'amber' || dotStatus === 'green') {
-                  // Dismiss the OFFICIAL dot in place (no navigation): delete
-                  // the manager's private marker and refresh the shared list
-                  // store, so the sidebar dot disappears on both surfaces.
-                  try {
-                    const manager = (sessions as unknown as {
-                      manager?: {
-                        completedNotifications?: Set<string>
-                        pendingInteractions?: Map<string, unknown>
-                        notifier?: { markDirty(): void }
-                      }
-                    }).manager
-                    const changed = dotStatus === 'green'
-                      ? (manager?.completedNotifications?.delete(session.id) ?? false)
-                      : (manager?.pendingInteractions?.delete(session.id) ?? false)
-                    if (changed) manager?.notifier?.markDirty()
-                  } catch {
-                    // Best-effort; the next list refresh re-baselines.
-                  }
-                  setUnread(session.id, false)
+                  // The official pending/completed markers have no in-place
+                  // dismissal in this DSH: opening the session is the official
+                  // "read" action that clears the reminder.
+                  handleContinue(session.id)
                 } else {
                   setUnread(session.id, dotStatus === null)
                 }
@@ -1859,9 +1789,9 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         className: 'dsh-row-action dsh-row-action--danger',
         variant: 'outline',
         size: 'sm',
-        icon: createElement(IconTrashOutline16, { size: 16 }),
+        icon: createElement(IconTrashOutlineRegular, { size: 16 }),
         disabled: isRunning || busy,
-        title: protectedReason !== '' && !isCurrent ? protectedReason : strings.delete,
+        title: protectedReason !== '' ? protectedReason : strings.delete,
         onClick: () => void handleDelete(session.id, session.displayTitle),
         children: busy ? strings.deleting : strings.delete,
       }),
@@ -1896,7 +1826,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         className: 'dsh-row-action dsh-row-action--danger',
         variant: 'outline',
         size: 'sm',
-        icon: createElement(IconTrashOutline16, { size: 16 }),
+        icon: createElement(IconTrashOutlineRegular, { size: 16 }),
         disabled: busy,
         onClick: () => void handlePurge(entry.sessionId, title),
         children: strings.purge,
@@ -1921,8 +1851,8 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
       createElement('label', { className: 'dsh-delete-session__batch-select-all' },
         createElement('input', {
           type: 'checkbox',
-          checked: activeRows.some((session) => !session.running && session.id !== list.current)
-            && activeRows.every((session) => session.running || session.id === list.current || selectedIds.has(session.id)),
+          checked: activeRows.some((session) => !session.running)
+            && activeRows.every((session) => session.running || selectedIds.has(session.id)),
           onChange: () => toggleSelectAll(),
           'aria-label': strings.selectAll,
         }),
@@ -1933,7 +1863,7 @@ function SessionManager({ useSessions, useWorkspaces, api, sessions, workspaceAc
         className: 'dsh-row-action dsh-row-action--danger',
         variant: 'outline',
         size: 'sm',
-        icon: createElement(IconTrashOutline16, { size: 16 }),
+        icon: createElement(IconTrashOutlineRegular, { size: 16 }),
         disabled: selectedIds.size === 0,
         title: strings.batchDelete,
         onClick: () => void handleBatchDelete(),
@@ -2000,8 +1930,6 @@ export function apply(ctx: ClientContext): void {
   style.textContent = STYLE
   document.head.append(style)
 
-  // The wire client: official session.history RPC for stats folding.
-  const { api } = ctx.get('connection') as ConnectionHandle
   // Resolve services at the ROOT context (apply time): the slot `inject:`
   // callbacks are evaluated inside the slot's own cordis scope, where these
   // services are not declared — accessing ctx.<service> there throws
@@ -2009,6 +1937,7 @@ export function apply(ctx: ClientContext): void {
   // ctx.effect callback (those run synchronously) to avoid TDZ crashes.
   const sessions = ctx.sessions
   const workspaces = ctx.workspaces
+  const uiWorkspace = ctx.uiWorkspace
 
   const syncLocale = (): void => {
     setAppLocale(ctx.locale.getLocale().active)
@@ -2021,22 +1950,6 @@ export function apply(ctx: ClientContext): void {
 
   // Locale dictionaries: the settings-section navigation label.
   ctx.effect(() => ctx.locale.register(NS, { zh: NAV_ZH, en: NAV_EN }), 'dsh-delete-session: dictionaries')
-
-  // Mark read when the OFFICIAL selection (sidebar click / any navigation)
-  // moves to a manually-unread session.
-  ctx.effect(() => {
-    let previous: string | undefined
-    const check = (): void => {
-      const current = sessions.list.getSnapshot().current
-      if (current !== undefined && current !== previous && unreadState.ids.has(current)) {
-        markRead(current)
-      }
-      previous = current
-    }
-    check()
-    const unsubscribe = sessions.list.subscribe(check)
-    return () => unsubscribe()
-  }, 'dsh-session-manager: selection auto-read')
 
   // Decorate OFFICIAL sidebar session rows with the blue manual-unread dot.
   // Official rows carry no session id, so rows are matched by their title
@@ -2131,7 +2044,7 @@ export function apply(ctx: ClientContext): void {
       order: 60,
       label: () => t('nav'),
       locale: NS,
-      inject: () => ({ api, sessions, workspaceActions: workspaces }),
+      inject: () => ({ sessions, workspaceActions: workspaces, uiWorkspace }),
     }, SessionManager)
     return () => {
       disposeRegistration()
@@ -2143,7 +2056,7 @@ export function apply(ctx: ClientContext): void {
   // also hosts the Session log button). Order, left to right:
   //   对话管理 (-40 host) → 对话管理按钮 (-30) → 删除本对话 (-10) → Session log (0)
   ctx.slots.inject('conversation.session.header.utilities', () => {
-    const common = () => ({ api, sessions })
+    const common = () => ({ sessions, workspaces, uiWorkspace })
     const disposers = [
       ctx.slots.register({
         name: 'conversation.session.header.utilities',
@@ -2177,8 +2090,9 @@ interface ClientContext {
   slots: SlotRegistry
   get<T>(service: string): T
   effect(effect: () => void | (() => void), label?: string): void
-  sessions: import('@deepseek-ai/dsh-client-runtime/client').ISessions
-  workspaces: import('@deepseek-ai/dsh-client-runtime/client').IWorkspaces
+  sessions: ISessions
+  workspaces: IWorkspaces
+  uiWorkspace: { openSession(target: SessionTarget): void }
   locale: {
     getLocale(): { active: string }
     subscribe(listener: () => void): () => void
@@ -2418,8 +2332,11 @@ function useDrawerState(): DrawerState {
 
 /** Injected share for the header buttons and drawer host. */
 interface DrawerInjected {
-  api: Pick<import('@deepseek-ai/dsh-api-remotes/client').IApiClient, 'sessions' | 'workspace'>
-  sessions: import('@deepseek-ai/dsh-client-runtime/client').ISessions
+  sessions: ISessions
+  workspaces: IWorkspaces
+  uiWorkspace: { openSession(target: SessionTarget): void }
+  /** Official per-session UI status feed (running / pending interaction / unread completion). */
+  useSessionStatus: UseSessionStatus
 }
 
 /** "对话管理" header button: open the drawer on the main list. */
@@ -2438,46 +2355,47 @@ function HeaderManageButton(_props: DrawerInjected): ReactElement {
 
 /**
  * Drawer host: a session-scope entry that renders the drawer into a portal
- * when open. The drawer reads the full corpus itself through the wire
- * (`session.list` / `workspace.list`) because session-scope slots do not
- * receive the `useSessions`/`useWorkspaces` hooks.
+ * when open. The drawer reads the corpus from the official Session and
+ * Workspace service snapshots (both live), plus the trash host route.
  */
-function SessionDrawerHost({ api, sessions }: DrawerInjected): ReactElement | null {
+function SessionDrawerHost({ sessions, workspaces, uiWorkspace, useSessionStatus }: DrawerInjected): ReactElement | null {
   const state = useDrawerState()
   if (!state.open) return null
   return createPortal(
-    createElement(SessionDrawer, { api, sessions }),
+    createElement(SessionDrawer, { sessions, workspaces, uiWorkspace, useSessionStatus }),
     document.body,
   )
 }
 
 /** One session row in the drawer, merged with the archive set. */
 interface DrawerRow {
-  sessionId: string
+  sessionId: SessionId
   title: string
   cwd?: string
   updatedAt: number
   running: boolean
   blank: boolean
   archived: boolean
-  /** Official pending-user-interaction state (sidebar amber dot). */
-  pendingInteraction?: unknown
-  /** Official "finished while unopened" reminder (sidebar green dot). */
-  completed?: boolean
 }
 
 /** The right drawer: full session management (list, archived, trash). */
-function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
+function SessionDrawer({ sessions, workspaces, uiWorkspace, useSessionStatus }: DrawerInjected): ReactElement {
   const state = useDrawerState()
   const strings = useLocaleStrings()
   // Subscribe to the official session store (same source the sidebar uses):
-  // running / pendingInteraction / completed stay live and in sync.
+  // running / pendingInteraction / completion stay live and in sync.
   const subscribe = useCallback((fn: () => void): (() => void) => sessions.list.subscribe(fn), [sessions])
   const getSnapshot = useCallback(() => sessions.list.getSnapshot(), [sessions])
   const list = useSyncExternalStore(subscribe, getSnapshot)
-  const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([])
-  const [archivedSet, setArchivedSet] = useState<ReadonlySet<string>>(new Set())
-  const [loadError, setLoadError] = useState(false)
+  // The Workspace service snapshot is live (the Controller follow stream owns
+  // it), so rows and the archive set need no polling.
+  const subscribeWorkspaces = useCallback((fn: () => void): (() => void) => workspaces.list.subscribe(fn), [workspaces])
+  const getWorkspaceSnapshot = useCallback(() => workspaces.list.getSnapshot(), [workspaces])
+  const workspaceSnapshot = useSyncExternalStore(subscribeWorkspaces, getWorkspaceSnapshot)
+  const statuses: SessionStatusLookup = useSessionStatus((value) => value)
+  const workspaceViews = workspaceSnapshot.items
+  const archivedSet = new Set(workspaceSnapshot.archivedSessionIds)
+  const loadError = workspaceSnapshot.error !== null
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [trashLimit, setTrashLimit] = useState(10)
   const [trashFailed, setTrashFailed] = useState(false)
@@ -2485,7 +2403,6 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   const [trashOpen, setTrashOpen] = useState(state.view === 'trash')
   const [busyId, setBusyId] = useState<string | null>(null)
   const [statsId, setStatsId] = useState<string | null>(null)
-  const [stats, setStats] = useState<StatsState | null>(null)
   const unread = useUnread()
   const [moreOpenId, setMoreOpenId] = useState<string | null>(null)
   const [newestFirst, setNewestFirst] = useState(true)
@@ -2497,7 +2414,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   const groupsRef = useRef<typeof activeGroups>([])
 
   // Rows derive from the official useSessions store (same source as the
-  // sidebar): live running/pendingInteraction/completed stay in sync.
+  // sidebar); the official status feed carries pending/completion live.
   const rows: DrawerRow[] | null = list.phase === 'ready'
     ? list.ids
       .map((id) => list.byId[id])
@@ -2510,8 +2427,6 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
         running: summary.running,
         blank: summary.blank,
         archived: archivedSet.has(summary.id),
-        pendingInteraction: summary.pendingInteraction,
-        completed: summary.completed,
       }))
     : null
 
@@ -2529,17 +2444,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [workspacesRes, trashRes] = await Promise.all([
-        api.workspace.list({}),
-        fetch(TRASH_ROUTE),
-      ])
-      if (workspacesRes.result.ok) {
-        setArchivedSet(new Set(workspacesRes.result.value.archivedSessionIds))
-        setWorkspaces(workspacesRes.result.value.items)
-        setLoadError(false)
-      } else {
-        setLoadError(true)
-      }
+      const trashRes = await fetch(TRASH_ROUTE)
       const trashData = (await trashRes.json().catch(() => ({}))) as TrashListResponse
       if (trashRes.ok && trashData.ok) {
         setTrash(trashData.entries)
@@ -2549,17 +2454,16 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
         setTrashFailed(true)
       }
     } catch {
-      setLoadError(true)
+      setTrashFailed(true)
     }
-  }, [api])
+  }, [])
 
   useEffect(() => {
     void load()
   }, [load])
 
-  // Poll while the drawer is open so running/idle states stay current (the
-  // wire list is a snapshot; a session that finished thinking should become
-  // deletable without reopening the drawer).
+  // Poll while the drawer is open so the trash stays current (the session and
+  // workspace lists themselves are live Controller snapshots).
   useEffect(() => {
     const timer = window.setInterval(() => {
       void load()
@@ -2617,7 +2521,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     // re-pull so the removed session leaves the client mirror and the
     // catalog settles.
     try {
-      await (sessions as { refresh?: () => Promise<unknown> }).refresh?.()
+      await sessions.refresh()
     } catch {
       // Best-effort; the next list refresh re-baselines anyway.
     }
@@ -2636,7 +2540,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     // Re-pull the list so a restored session re-enters the client mirror
     // (the delete flow removed it from the retained summaries).
     try {
-      await (sessions as { refresh?: () => Promise<unknown> }).refresh?.()
+      await sessions.refresh()
     } catch {
       // Best-effort; the next list refresh re-baselines anyway.
     }
@@ -2655,35 +2559,18 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     // Same as delete: drop the purged session from the retained summaries
     // so the official subagent catalog does not keep tracking it.
     try {
-      await (sessions as { refresh?: () => Promise<unknown> }).refresh?.()
+      await sessions.refresh()
     } catch {
       // Best-effort; the next list refresh re-baselines anyway.
     }
   }, [strings, postAction, load, refreshTrash, sessions])
 
-  const handleStats = useCallback(async (sessionId: string): Promise<void> => {
-    if (statsId === sessionId) {
-      setStatsId(null)
-      setStats(null)
-      return
-    }
-    setStatsId(sessionId)
-    setStats({ status: 'loading', data: null })
-    try {
-      const response = await api.sessions.history({ sessionId: sessionId as WireSessionId })
-      if (!response.result.ok) {
-        setStats({ status: 'error', data: null })
-        return
-      }
-      setStats({ status: 'ready', data: foldStats(response.result.value.events) })
-    } catch {
-      setStats({ status: 'error', data: null })
-    }
-  }, [api, statsId])
+  const handleStats = useCallback((sessionId: string): void => {
+    setStatsId((previous) => (previous === sessionId ? null : sessionId))
+  }, [])
 
   const closeStats = useCallback((): void => {
     setStatsId(null)
-    setStats(null)
   }, [])
 
   useEffect(() => {
@@ -2704,75 +2591,33 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
 
   const handleContinue = useCallback((sessionId: string): void => {
     markRead(sessionId)
-    sessions.open(sessionId as SessionId)
+    uiWorkspace.openSession(sessionId as SessionId)
     setDrawer({ open: false })
-  }, [sessions])
+  }, [uiWorkspace])
 
   // Fork the session into a new child conversation, then open the child and
   // close the drawer.
   const handleFork = useCallback(async (sessionId: string): Promise<void> => {
     setBusyId(sessionId)
     try {
-      const response = await api.sessions.fork({ sessionId: sessionId as WireSessionId })
-      if (!response.result.ok) throw new Error(response.result.error?.code ?? 'fork-failed')
-      const childId = response.result.value.sessionId
-      sessions.open(childId as SessionId)
+      const childId = await sessions.fork({ sessionId: sessionId as SessionId })
+      uiWorkspace.openSession(childId)
       setDrawer({ open: false })
     } catch (error) {
-      const code = error instanceof Error ? error.message : ''
+      const code = remoteErrorCode(error)
       const friendly = code === 'fork-unavailable' ? strings.forkUnavailable : ''
       const suffix = friendly !== '' ? ` (${friendly})` : code !== '' ? ` (${code})` : ''
       showAlert(strings.forkFailed + suffix)
     } finally {
       setBusyId(null)
     }
-  }, [api, sessions, strings, showAlert])
+  }, [sessions, uiWorkspace, strings, showAlert])
 
   const renderStatsDialog = (): ReactElement | null => {
-    if (statsId === null || stats === null) return null
+    if (statsId === null) return null
     const sessionTitle = rows?.find((row) => row.sessionId === statsId)?.title ?? statsId
-    let body: ReactElement
-    if (stats.status === 'loading') {
-      body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsLoading)
-    } else if (stats.status === 'error') {
-      body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsFailed)
-    } else {
-      const data = stats.data
-      if (data === null || (data.turns === 0 && data.userMessages === 0 && data.assistantMessages === 0 && data.toolCalls.length === 0)) {
-        body = createElement('div', { className: 'dsh-stats-dialog__body' }, strings.statsEmpty)
-      } else {
-        const items: { label: string; value: string | ReactElement }[] = [
-          { label: strings.statsTurns, value: String(data.turns) },
-          { label: strings.statsUser, value: String(data.userMessages) },
-          { label: strings.statsAssistant, value: String(data.assistantMessages) },
-        ]
-        if (data.toolCalls.length > 0) {
-          items.push({
-            label: strings.statsTools,
-            value: createElement('div', { className: 'dsh-stats-dialog__tools' },
-              ...data.toolCalls.map((tool) => createElement('span', {
-                className: 'dsh-stats-dialog__tool',
-                key: tool.name,
-              }, `${tool.name} ×${tool.count}`)),
-            ),
-          })
-        }
-        if (data.startedAt > 0 && data.updatedAt > 0) {
-          items.push({
-            label: strings.statsWindow,
-            value: `${strings.deletedAt(data.startedAt)} ~ ${strings.deletedAt(data.updatedAt)}`,
-          })
-        }
-        body = createElement('div', { className: 'dsh-stats-dialog__body' },
-          createElement('dl', { className: 'dsh-stats-dialog__grid' },
-            ...items.flatMap((item) => [
-              createElement('dt', { className: 'dsh-stats-dialog__label', key: `${item.label}-label` }, item.label),
-              createElement('dd', { className: 'dsh-stats-dialog__value', key: `${item.label}-value` }, item.value),
-            ]),
-          ),
-        )
-      }
-    }
+    const stats = list.projectionsBySession[statsId as SessionId]?.values?.['sessionStats']
+    const body: ReactElement = renderStatsBody(strings, stats)
     return createElement('div', {
       'data-dsh-stats-backdrop': '',
       onMouseDown: (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -2818,31 +2663,16 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
         createElement('div', { className: 'dsh-delete-session__row-title', title: row.title },
           createElement('span', { className: 'dsh-delete-session__row-title-text' }, row.title),
           (() => {
-            const dotStatus = rowStatusDot(row, unread.has(row.sessionId))
+            const dotStatus = rowStatusDot(statuses.get(row.sessionId), unread.has(row.sessionId))
             return renderStatusDot(
               dotStatus,
               dotStatus !== null ? strings.read : strings.unread,
               () => {
                 if (dotStatus === 'amber' || dotStatus === 'green') {
-                  // Dismiss the OFFICIAL dot in place (no navigation): delete
-                  // the manager's private marker and refresh the shared list
-                  // store, so the sidebar dot disappears on both surfaces.
-                  try {
-                    const manager = (sessions as unknown as {
-                      manager?: {
-                        completedNotifications?: Set<string>
-                        pendingInteractions?: Map<string, unknown>
-                        notifier?: { markDirty(): void }
-                      }
-                    }).manager
-                    const changed = dotStatus === 'green'
-                      ? (manager?.completedNotifications?.delete(row.sessionId) ?? false)
-                      : (manager?.pendingInteractions?.delete(row.sessionId) ?? false)
-                    if (changed) manager?.notifier?.markDirty()
-                  } catch {
-                    // Best-effort; the next list refresh re-baselines.
-                  }
-                  setUnread(row.sessionId, false)
+                  // The official pending/completed markers have no in-place
+                  // dismissal in this DSH: opening the session is the official
+                  // "read" action that clears the reminder.
+                  handleContinue(row.sessionId)
                 } else {
                   setUnread(row.sessionId, dotStatus === null)
                 }
@@ -2911,7 +2741,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       createElement(Button, {
         className: 'dsh-row-action dsh-row-action--danger',
         variant: 'outline', size: 'sm',
-        icon: createElement(IconTrashOutline16, { size: 16 }),
+        icon: createElement(IconTrashOutlineRegular, { size: 16 }),
         disabled: row.running || busy,
         title: row.running ? strings.running : strings.delete,
         onClick: () => void handleDelete(row.sessionId, row.title),
@@ -2944,7 +2774,7 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
       createElement(Button, {
         className: 'dsh-row-action dsh-row-action--danger',
         variant: 'outline', size: 'sm',
-        icon: createElement(IconTrashOutline16, { size: 16 }),
+        icon: createElement(IconTrashOutlineRegular, { size: 16 }),
         disabled: busy,
         onClick: () => void handlePurge(entry.sessionId, title), children: strings.purge,
       }),
@@ -2962,16 +2792,16 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
   const sortRows = (list: DrawerRow[]): DrawerRow[] =>
     [...list].sort((a, b) => (newestFirst ? b.updatedAt - a.updatedAt : a.updatedAt - b.updatedAt))
   const activeGroups: { workspaceId: string; title: string; rows: DrawerRow[] }[] = []
-  for (const view of workspaces) {
-    const groupRows = sortRows(activeRows.filter((row) => view.sessionIds.includes(row.sessionId as WireSessionId)))
+  for (const view of workspaceViews) {
+    const groupRows = sortRows(activeRows.filter((row) => view.sessionIds.includes(row.sessionId)))
     if (groupRows.length > 0) activeGroups.push({ workspaceId: view.workspaceId, title: view.title || view.path, rows: groupRows })
   }
   const ungroupedActive = sortRows(activeRows.filter((row) =>
-    !workspaces.some((view) => view.sessionIds.includes(row.sessionId as WireSessionId))))
+    !workspaceViews.some((view) => view.sessionIds.includes(row.sessionId))))
   if (ungroupedActive.length > 0) activeGroups.push({ workspaceId: '__ungrouped__', title: strings.ungrouped, rows: ungroupedActive })
   groupsRef.current = activeGroups
 
-  // Drag-and-drop workspace reordering through the official wire API.
+  // Drag-and-drop workspace reordering through the official Workspace service.
   // Slot-based: dropping into a slot inserts the dragged workspace there;
   // dropping on a label swaps the two workspaces.
   const handleWorkspaceDrop = useCallback(async (slot: string | null): Promise<void> => {
@@ -2993,15 +2823,11 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
         beforeWorkspaceId = slot.slice(7)
       }
       // '__end__' leaves beforeWorkspaceId undefined → appended to the very end.
-      await api.workspace.insertBefore({
-        workspaceId: dragged as never,
-        beforeWorkspaceId: beforeWorkspaceId as never,
-      })
-      await load()
+      await workspaces.insertBefore(dragged as WorkspaceId, beforeWorkspaceId as WorkspaceId | undefined)
     } catch {
-      // Reordering is best-effort; the next poll re-baselines the list.
+      // Reordering is best-effort; the Controller snapshot re-baselines it.
     }
-  }, [api, load, dragWorkspaceId])
+  }, [workspaces, dragWorkspaceId])
 
   // Move a workspace to the top of the group list.
   const moveWorkspaceToTop = useCallback(async (workspaceId: string): Promise<void> => {
@@ -3009,15 +2835,11 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     const firstId = order.find((id) => id !== '__ungrouped__')
     if (firstId === undefined || firstId === workspaceId) return
     try {
-      await api.workspace.insertBefore({
-        workspaceId: workspaceId as never,
-        beforeWorkspaceId: firstId as never,
-      })
-      await load()
+      await workspaces.insertBefore(workspaceId as WorkspaceId, firstId as WorkspaceId)
     } catch {
-      // Best-effort; the next poll re-baselines the list.
+      // Best-effort; the Controller snapshot re-baselines it.
     }
-  }, [api, load])
+  }, [workspaces])
 
   // Rename a workspace through a prompt dialog.
   const renameWorkspace = useCallback(async (group: { workspaceId: string; title: string }): Promise<void> => {
@@ -3026,29 +2848,22 @@ function SessionDrawer({ api, sessions }: DrawerInjected): ReactElement {
     const title = input.trim()
     if (title === '' || title === group.title) return
     try {
-      await api.workspace.rename({
-        workspaceId: group.workspaceId as never,
-        title: title as never,
-      })
-      await load()
+      await workspaces.rename(group.workspaceId as WorkspaceId, title)
     } catch {
-      // Best-effort; the next poll re-baselines the list.
+      // Best-effort; the Controller snapshot re-baselines it.
     }
-  }, [api, load])
+  }, [workspaces])
 
   // Delete a workspace after a confirmation dialog; its sessions fall back
   // to the ungrouped bucket.
   const deleteWorkspace = useCallback(async (group: { workspaceId: string; title: string }): Promise<void> => {
     if (!window.confirm(strings.workspaceDeleteConfirm.replace('{title}', group.title))) return
     try {
-      await api.workspace.delete({
-        workspaceId: group.workspaceId as never,
-      })
-      await load()
+      await workspaces.delete(group.workspaceId as WorkspaceId)
     } catch {
-      // Best-effort; the next poll re-baselines the list.
+      // Best-effort; the Controller snapshot re-baselines it.
     }
-  }, [api, load])
+  }, [workspaces])
 
   const renderWorkspaceLabel = (
     group: { workspaceId: string; title: string; rows: DrawerRow[] },
