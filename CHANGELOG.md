@@ -1,3 +1,40 @@
+## v0.4.0 (2026-10-03)
+
+本次为 **DSH 0.2.0-rc.2 兼容性适配**。与 v0.3.0 那次（改了大量主机/客户端 API）不同，**这次不需要动任何源码**：v0.3.0 的代码在 0.2.0-rc.2 下类型检查零错误、构建产物逐字节一致，真正卡住的是 DSH 0.2.0 的**插件版本门禁**。
+
+### 兼容性（本版本用于 DSH 0.2.0-rc.2）
+
+- **修复「安装被拒绝」**。DSH 0.2.0 在装载 profile 与启动预检时会校验插件清单里的 `peerDependencies`（只检查名字为 `@deepseek-ai/dsh` 或 `@deepseek-ai/dsh-*` 的项），拿声明的**范围**去匹配**运行中的 DSH 版本**（预发布版参与匹配）：
+
+  ```
+  dsh: installation rejected: Plugin dsh-session-manager@0.3.0 is incompatible with
+  dsh 0.2.0-rc.2: peerDependencies {"@deepseek-ai/dsh-session":"^0.1.0-rc.6", ...}.
+  Running it may cause crashes or data loss. ...
+  dsh: restored package.json, pnpm-lock.yaml, and node_modules.
+  ```
+
+  v0.3.0 声明的是 `^0.1.0-rc.6`，对 0.x 版本等价于 `>=0.1.0-rc.6 <0.2.0`，**永远不可能**匹配 0.2.0-rc.2。现把 10 项 `@deepseek-ai/dsh-*` 全部改为 `^0.2.0-rc.1`（即 `>=0.2.0-rc.1 <0.3.0`）。
+
+  注意症状具有迷惑性：git / tarball 规格的安装**先跑 pnpm、再做门禁校验**，失败后回滚清单、锁文件与 `node_modules`，所以看起来像「装上了、一刷新就没了」；而本地路径规格会在 pnpm 之前就被拒绝（`dsh: nothing was installed.`）。
+
+- **开发依赖升到 0.2.0-rc.2**：`devDependencies` 里 27 个 `@deepseek-ai/*` 由 `0.1.7-rc.2` 升到 `0.2.0-rc.2`，`peerDependencies` 的 `@deepseek-ai/cordis` / `cosmokit` / `schemastery` / `zod` 不在门禁检查范围内，保持原样。
+
+### 验证（在本机 DSH 0.2.0-rc.2 上实测）
+
+- `tsc -p tsconfig.json --noEmit`：**0 error**（0.2.0-rc.2 类型下）
+- `vitest run`：**3/3 通过**
+- `tsdown` 重建 `lib/`：与仓库既有产物**逐字节一致**（无内容差异，仅行尾），即所用 API 在 0.2.0-rc.2 中无破坏性变更
+- 用隔离的 DSH_HOME 实测安装门禁：同一份代码**只改 `peerDependencies`**
+  - 改前（`^0.1.0-rc.6`）：`dsh plugin add` 被拒，输出与线上报错一致
+  - 改后（`^0.2.0-rc.1`）：安装成功（exit 0），且插件管理器自动把 `dsh-session-manager` 选入 `dsh.profile.bundles`
+- `dsh --profile <test> --dump-config`：组合树里出现 `dsh-session-manager` 行，无 `disabling profile plugin` 告警
+- 启动该 profile 的 web 应用（隔离 home + 独立端口）：索引 HTML 的启动图里，客户端产物被排进 application combo（`plugins/??…,dsh-session-manager/client.js,…&rev=…`）——说明 0.2.0 的客户端模块组合接受了插件的 `dsh.client` 声明
+
+### 说明
+
+- 客户端产物沿用与 DSH 0.2.0 第一方客户端插件完全相同的注册形态（`window.__ModuleLoader__.load({ id: "<包名>", factory: (require) => … })`），`react` / `react-dom` / `react/jsx-runtime` / `@deepseek-ai/dsh-client-ui-primitives` 都在浏览器基线模块表内（第一方插件同样直接 `require` 且不在 `dsh.client.external` 里声明），因此**无需**新增 `external` 声明。
+- 若需要同时兼容 0.1.7-rc.2 与新版本，可把范围写成 `^0.1.0-rc.6 || ^0.2.0-rc.1`；本版本按仓库既有惯例（一个版本对齐一个 DSH 版本）只声明 0.2.x，与 v0.3.0 只声明 0.1.x 的做法一致。
+
 ## v0.3.0 (2026-09-26)
 
 本次为 **DSH 0.1.7-rc.2 兼容性适配**，同时修复了仓库里长期存在的构建与发布问题。

@@ -12,8 +12,23 @@
 
 | DSH 版本 | 插件版本 |
 |---|---|
-| **0.1.7-rc.2** | **v0.3.0+**（当前） |
+| **0.2.0-rc.2** | **v0.4.0+**（当前） |
+| 0.1.7-rc.2 | v0.3.0 |
 | 0.1.6 及更早、0.1.7-alpha | v0.2.x（不再维护） |
+
+v0.4.0 是针对 DSH **0.2.0-rc.2** 的兼容性适配版本。与 v0.3.0 不同，**这次不需要改任何源码**：0.2.0 的插件版本门禁会拿 `peerDependencies` 里的版本范围去校验运行中的 DSH 版本（只检查 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 两类），v0.3.0 声明的 `^0.1.0-rc.6` 对 0.x 等价于 `>=0.1.0-rc.6 <0.2.0`，因此安装被直接拒绝：
+
+```
+dsh: installation rejected: Plugin dsh-session-manager@0.3.0 is incompatible with
+dsh 0.2.0-rc.2: peerDependencies {"@deepseek-ai/dsh-session":"^0.1.0-rc.6", ...}.
+dsh: restored package.json, pnpm-lock.yaml, and node_modules.
+```
+
+因为回滚发生在 pnpm 安装之后，症状是「装上了、一刷新就没了」。v0.4.0 把这些范围改为 `^0.2.0-rc.1`，并把 `devDependencies` 升到 `0.2.0-rc.2` 重新类型检查与构建（`lib/` 产物与 v0.3.0 逐字节一致，说明所用 API 无破坏性变更）。完整清单见 [CHANGELOG](CHANGELOG.md)。
+
+> 如果还需要在 0.1.7-rc.2 上使用，请改用 v0.3.0；本版本按仓库惯例只对齐一个 DSH 版本。
+
+### v0.3.0（历史）
 
 v0.3.0 是针对 DSH **0.1.7-rc.2** 的兼容性适配版本。该版本 DSH 有几处破坏性变更导致 v0.2.x 无法工作（图标导出改名、`dsh.client.inject` 契约、`SessionPersistence` 快照结构、`locate()` 移出契约、`ConnectionHandle.api` 门面拆解等），完整清单见 [CHANGELOG](CHANGELOG.md)。
 

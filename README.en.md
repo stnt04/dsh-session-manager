@@ -124,7 +124,9 @@ The dot next to a session's title shows one of four states: **blue** = manually 
 
 ## Compatibility
 
-Current version targets DSH `0.1.1-rc.1` (depends on the `settings.section` / `settings.general.item` / `conversation.session.header.utilities` slots and the `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.storageDomain` / `ctx.agentPresets` services). If slots or service APIs change in a future DSH version, the plugin needs a matching update.
+Current version (**v0.4.0+**) targets DSH **0.2.0-rc.2**. DSH 0.2.0 enforces a plugin version gate: the ranges in your `peerDependencies` are checked against the running DSH version (only peers named `@deepseek-ai/dsh` or `@deepseek-ai/dsh-*` are examined), and a mismatch rejects the installation outright. v0.3.0 declared `^0.1.0-rc.6`, which for a 0.x version means `>=0.1.0-rc.6 <0.2.0` and can never match 0.2.0-rc.2, so installation failed with `installation rejected: ... is incompatible with dsh 0.2.0-rc.2` and the profile was rolled back after pnpm had already run. v0.4.0 widens those ranges to `^0.2.0-rc.1` and raises `devDependencies` to `0.2.0-rc.2`; no source change was needed (typecheck is clean and the rebuilt `lib/` is byte-identical to v0.3.0). Use **v0.3.0** if you still run DSH 0.1.7-rc.2.
+
+Earlier versions targeted DSH `0.1.1-rc.1` and depend on the `settings.section` / `settings.general.item` / `conversation.session.header.utilities` slots plus the `ctx.sessionPersistence` / `ctx.workspaceRegistry` / `ctx.agents` / `ctx.storageDomain` / `ctx.agentPresets` services. If slots or service APIs change in a future DSH version, the plugin needs a matching update.
 
 ## Development
 
